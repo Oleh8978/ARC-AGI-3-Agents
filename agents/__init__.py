@@ -14,6 +14,8 @@ from .templates.openclaw_agent import OpenClaw
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
+from .templates.hypothesis_agent import HypothesisAgent
+from .templates.goal_directed_agent import GoalDirectedAgent
 
 load_dotenv()
 
