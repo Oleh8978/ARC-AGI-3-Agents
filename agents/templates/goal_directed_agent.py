@@ -202,10 +202,18 @@ class TransitionGraph:
         self.edges[pos_before][action_name] = pos_after if moved else None
         self.visit_count[pos_before] += 1
 
-    def bfs_path(self, start: Pos, goal: Pos) -> Optional[list[str]]:
-        """BFS over known transitions. Returns list of action names, or None
-        if goal is not yet reachable in the known graph."""
-        if start == goal:
+    def bfs_path(self, start: Pos, goal: Pos, goal_radius: int = 2) -> Optional[list[str]]:
+        """BFS over known transitions. Returns list of action names to reach
+        a node within goal_radius Manhattan distance of goal, or None.
+
+        Using goal_radius > 0 is critical: the goal_pos is a centroid of the
+        goal colour region, not a position the player necessarily occupies.
+        The player completes the level by entering a cell NEAR the goal, not
+        by landing exactly on the centroid. Using radius=0 meant BFS could
+        never find the goal (confirmed: 500 actions, 43 graph nodes, bfs=?
+        throughout, because goal centroid (20,32) never appeared as a node).
+        """
+        if abs(start[0]-goal[0]) + abs(start[1]-goal[1]) <= goal_radius:
             return []
         queue: deque[tuple[Pos, list[str]]] = deque([(start, [])])
         visited: set[Pos] = {start}
@@ -215,11 +223,41 @@ class TransitionGraph:
                 if next_pos is None or next_pos in visited:
                     continue
                 new_path = path + [action_name]
-                if next_pos == goal:
+                if abs(next_pos[0]-goal[0]) + abs(next_pos[1]-goal[1]) <= goal_radius:
                     return new_path
                 visited.add(next_pos)
                 queue.append((next_pos, new_path))
-        return None  # goal not yet connected in known graph
+        return None
+
+    def frontier_nodes(self) -> list[Pos]:
+        """Positions with at least one uncharted edge — the frontier of the
+        known world model. Exploring these expands the graph."""
+        all_directions = set(ACTION_DIRECTION.keys())
+        return [
+            pos for pos, action_map in self.edges.items()
+            if set(action_map.keys()) < all_directions
+        ]
+
+    def bfs_to_frontier(self, start: Pos) -> Optional[list[str]]:
+        """BFS to the nearest frontier node. Used when current position is
+        fully charted (all 4 directions tried) — forces navigation toward
+        unexplored territory instead of wandering known space."""
+        frontiers = set(self.frontier_nodes())
+        if not frontiers or start in frontiers:
+            return None
+        queue: deque[tuple[Pos, list[str]]] = deque([(start, [])])
+        visited: set[Pos] = {start}
+        while queue:
+            pos, path = queue.popleft()
+            for action_name, next_pos in self.edges.get(pos, {}).items():
+                if next_pos is None or next_pos in visited:
+                    continue
+                new_path = path + [action_name]
+                if next_pos in frontiers:
+                    return new_path
+                visited.add(next_pos)
+                queue.append((next_pos, new_path))
+        return None
 
     def goal_biased_exploration(
         self,
@@ -278,9 +316,17 @@ class GoalDirectedAgent(Agent):
     """Phase 3 agent: builds an empirical transition graph through active
     exploration, then uses BFS over the graph to find the true shortest path
     to the goal, bypassing the Manhattan-distance heuristic that failed in
-    Phase 2 due to maze walls."""
+    Phase 2 due to maze walls.
 
-    MAX_ACTIONS = 200
+    Key improvements over Phase 2:
+    - MAX_ACTIONS=500 to allow completing multiple levels per run
+    - World model (TransitionGraph) persists across level transitions —
+      the maze layout for earlier parts carries over, only the goal shifts
+    - GoalDetector resets on level completion to find the new goal
+    - BFS replanning triggers immediately when level completes
+    """
+
+    MAX_ACTIONS = 500
     CALIBRATION_CYCLE = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
 
     def __init__(self, *args, **kwargs) -> None:
@@ -294,7 +340,8 @@ class GoalDirectedAgent(Agent):
         self._pending_grid_before: Optional[np.ndarray] = None
         self._pending_pos_before: Optional[Pos] = None
         self._action_count = 0
-        self._planned_path: list[str] = []  # BFS-computed action sequence
+        self._planned_path: list[str] = []
+        self._last_levels_completed: int = 0  # track level transitions
         random.seed(random.randint(0, 10**9))
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -384,13 +431,31 @@ class GoalDirectedAgent(Agent):
             self._planned_path = []
 
         # ── Exploration: build the graph toward the goal ─────────────────────
-        # No BFS path yet — the goal isn't reachable in the known graph.
-        # Use goal-biased exploration: prefer actions leading to under-visited
-        # positions that are ALSO geometrically closer to the goal. Pure
-        # novelty-seeking (v1 "least_visited_action") was the critical failure:
-        # it drove the agent toward the southern part of the maze (less visited)
-        # but further from the goal — the graph grew but never connected to
-        # goal position (20,32), leaving bfs_steps=? for the entire run.
+        # No BFS path to goal yet. Two strategies:
+        # 1. If current pos is fully charted (all 4 directions tried), use
+        #    bfs_to_frontier to navigate toward unexplored territory.
+        # 2. Otherwise, use goal_biased_exploration to expand toward goal.
+        all_dir_names = set(ACTION_DIRECTION.keys())
+        current_known = set(self.world_model.edges.get(current_pos, {}).keys())
+        current_fully_explored = all_dir_names <= current_known
+
+        if current_fully_explored:
+            frontier_path = self.world_model.bfs_to_frontier(current_pos)
+            if frontier_path:
+                if not self._planned_path:
+                    self._planned_path = frontier_path
+                    logger.info(
+                        f"[goal-agent] frontier BFS: {len(frontier_path)} steps "
+                        f"to nearest unexplored node from {current_pos}"
+                    )
+
+        if self._planned_path:
+            next_name = self._planned_path[0]
+            matching = [a for a in candidates if a.name == next_name]
+            if matching:
+                return matching[0]
+            self._planned_path = []
+
         best = self.world_model.goal_biased_exploration(current_pos, candidates, goal_pos)
         if best is not None and random.random() > 0.15:
             return best
@@ -425,6 +490,22 @@ class GoalDirectedAgent(Agent):
                     self._planned_path = []
 
         self._action_count += 1
+
+        # Detect level transition — when levels_completed increases, the goal
+        # changes but the maze graph remains useful (shared topology).
+        # Reset: goal_detector (new goal to find), planned_path (replan).
+        # Keep: world_model graph, player_color, tracker (same game mechanics).
+        if frame.levels_completed > self._last_levels_completed:
+            logger.info(
+                f"[goal-agent] LEVEL COMPLETE! {self._last_levels_completed} → "
+                f"{frame.levels_completed}. Resetting goal detector, keeping graph "
+                f"({len(self.world_model.edges)} nodes)."
+            )
+            self._last_levels_completed = frame.levels_completed
+            self.goal_detector = GoalDetector()  # find new goal
+            self.goal_color = None               # re-detect on next frames
+            self._planned_path = []              # force BFS replan
+
         if self._action_count % 20 == 0:
             n_nodes = len(self.world_model.edges)
             n_edges = sum(len(v) for v in self.world_model.edges.values())

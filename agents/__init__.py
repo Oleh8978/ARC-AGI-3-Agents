@@ -52,4 +52,6 @@ __all__ = [
     "AVAILABLE_AGENTS",
     "MultiModalLLM",
     "OpenClaw",
+    "HypothesisAgent",
+    "GoalDirectedAgent"
 ]
