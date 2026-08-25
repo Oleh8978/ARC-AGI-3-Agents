@@ -214,12 +214,13 @@ def make_bare_agent() -> HypothesisWorldAgent:
     # re-run the REAL subclass __init__ body manually since super().__init__
     # needs constructor args we don't have; call the part after super():
     from world_model.hypotheses import HypothesisEngine
-    from agents.templates.goal_directed_agent import GoalDetector, TransitionGraph
+    from world_model.stagnation_graph import StagnationAwareTransitionGraph
+    from agents.templates.goal_directed_agent import ACTION_DIRECTION, GoalDetector
     import random as _random
 
     agent.engine = HypothesisEngine()
     agent.goal_detector = GoalDetector()
-    agent.world_model = TransitionGraph()
+    agent.world_model = StagnationAwareTransitionGraph(ACTION_DIRECTION)
     agent.player_color = None
     agent.goal_color = None
     agent._pending_action = None

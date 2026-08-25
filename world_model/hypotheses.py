@@ -176,6 +176,23 @@ class HypothesisEngine:
     def active_vanish_rules(self) -> list[VanishNearHypothesis]:
         return [h for h in self.vanish_near.values() if not h.falsified and h.vanish_while_adjacent >= 1]
 
+    def likely_hazard_colors(self, player_color: int) -> set[int]:
+        """Colors that disappear specifically upon contact with the player
+        (not just any object) -- our best available signal for "something
+        happens when I touch this", found via live testing on ls20: a
+        mobile object caused a resource/health-bar drain on contact
+        (confirmed via pixel-level bar measurement + screenshot showing
+        the player adjacent to it right before the drain). We can't tell
+        collectible from hazard from vision alone, so this is a
+        conservative "treat contact as costly, prefer avoiding it when a
+        detour is cheap" signal, not a certainty -- callers should use it
+        as a soft planning penalty, not a hard wall.
+        """
+        return {
+            ca for (ca, cb), h in self.vanish_near.items()
+            if cb == player_color and not h.falsified and h.vanish_while_adjacent >= 1
+        }
+
     def best_player_color(self) -> Optional[int]:
         """A 'player' color is one with strong, CONSISTENT constant-delta
         evidence across at least 2 different actions (moves differently

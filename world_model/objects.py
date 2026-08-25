@@ -41,6 +41,34 @@ class GameObject:
         return (min(xs), min(ys), max(xs), max(ys))
 
 
+def detect_held_indicator(
+    objects: list[GameObject], player_centroid: tuple[float, float],
+    exclude_colors: set[int], radius: float = 2.5
+) -> Optional[int]:
+    """Returns the color of whichever non-excluded object is CLOSEST to
+    the player, if within `radius` cells -- our perception hook for the
+    "held key/item" mechanic confirmed (via external research) to drive
+    ls20: the avatar carries a key whose shape/color changes when
+    walking over "rotator" tiles, and a door only opens when the held
+    key matches. This function doesn't know anything about doors or
+    matching -- it just reports "what's the nearest other object's
+    color right now", every frame. StatefulTransitionGraph is what
+    turns repeated observations of this into a usable state variable.
+    """
+    best_color: Optional[int] = None
+    best_dist: Optional[float] = None
+    px, py = player_centroid
+    for obj in objects:
+        if obj.color in exclude_colors:
+            continue
+        ox, oy = obj.centroid
+        d = ((ox - px) ** 2 + (oy - py) ** 2) ** 0.5
+        if d <= radius and (best_dist is None or d < best_dist):
+            best_color = obj.color
+            best_dist = d
+    return best_color
+
+
 def extract_objects(grid: np.ndarray, background_colors: Optional[set[int]] = None,
                      max_object_cells: int = 400) -> list[GameObject]:
     """Connected-component labeling per color (4-connectivity).

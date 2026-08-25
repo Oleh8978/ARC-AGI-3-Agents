@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time as _time
 from typing import Optional
 
 import numpy as np
@@ -46,14 +47,72 @@ from .goal_directed_agent import (
     ACTION_DIRECTION,
     GoalDetector,
     Pos,
-    TransitionGraph,
     color_centroids,
     grid_to_array,
 )
 from world_model.objects import extract_objects
 from world_model.hypotheses import HypothesisEngine
+from world_model.stagnation_graph import StagnationAwareTransitionGraph
 
 logger = logging.getLogger()
+
+
+def _looks_like_network_failure(e: Exception, requests_module) -> bool:
+    """Two known signatures of the same transient server-side hiccup
+    against three.arcprize.org, confirmed via live testing:
+    1. requests.exceptions.RequestException surfaces directly in some
+       cases (ReadTimeout, ConnectionError).
+    2. In OTHER cases, arc_agi/remote_wrapper.py catches the network
+       exception itself internally (it logs "Failed to perform action...
+       Read timed out" and returns None instead of re-raising), and the
+       base Agent.do_action_request()/_convert_raw_frame_data() then
+       raises ValueError("Received None frame data from environment")
+       -- a different exception type carrying the same underlying cause.
+    Only these two specific, evidence-backed signatures are treated as
+    retryable; anything else (a real bug, a validation error) is not.
+    """
+    if requests_module is not None and isinstance(e, requests_module.exceptions.RequestException):
+        return True
+    if isinstance(e, ValueError) and "Received None frame data from environment" in str(e):
+        return True
+    return False
+
+
+def call_with_network_retry(fn, attempts: int, delay_seconds: float, log_prefix: str = ""):
+    """Calls fn() and retries up to `attempts` times ONLY on a known
+    transient network-failure signature (see _looks_like_network_failure).
+    Any other exception (a real bug, a validation error) is re-raised
+    immediately, never retried -- silently swallowing non-network errors
+    here would hide genuine bugs.
+
+    Uses exponential backoff (delay_seconds * 2**attempt) rather than a
+    fixed delay: live testing showed failures more severe than a slow
+    server response (DNS resolution failures, SSL handshake timeouts --
+    signs of a genuinely unstable local/ISP network path, not just
+    three.arcprize.org being slow). A fixed short delay hammers a network
+    that needs longer to recover; backoff gives it that time without
+    making the happy-path (a single blip) wait any longer than before.
+    """
+    try:
+        import requests as _requests
+    except ImportError:
+        _requests = None  # sandbox without requests installed: never retry
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not _looks_like_network_failure(e, _requests):
+                raise
+            last_exc = e
+            if attempt < attempts - 1:
+                wait = delay_seconds * (2 ** attempt)
+                logger.warning(f"{log_prefix} attempt {attempt + 1}/{attempts} failed: "
+                                f"{e!r} -- retrying in {wait}s")
+                _time.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
 
 
 class HypothesisWorldAgent(Agent):
@@ -68,12 +127,33 @@ class HypothesisWorldAgent(Agent):
     # (see HypothesisEngine.best_player_color). With 4 actions that's a
     # firm floor; we cycle a bit longer to get repeated evidence per action.
     MIN_CALIBRATION_STEPS = 10
+    # Live testing kept getting cut short by network failures against
+    # three.arcprize.org -- initially plain ReadTimeout (server slowness),
+    # later also NameResolutionError and SSL handshake timeouts (signs of
+    # a genuinely unstable local/ISP network, not just server slowness).
+    # 5 attempts with exponential backoff (5s, 10s, 20s, 40s) gives a
+    # flaky connection real recovery time without masking a truly dead
+    # connection forever.
+    ACTION_RETRY_ATTEMPTS = 5
+    ACTION_RETRY_DELAY_SECONDS = 5.0
+
+    def do_action_request(self, action: GameAction) -> FrameData:
+        return call_with_network_retry(
+            lambda: super(HypothesisWorldAgent, self).do_action_request(action),
+            attempts=self.ACTION_RETRY_ATTEMPTS,
+            delay_seconds=self.ACTION_RETRY_DELAY_SECONDS,
+            log_prefix="[hyp-agent] action request",
+        )
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.engine = HypothesisEngine()
         self.goal_detector = GoalDetector()
-        self.world_model = TransitionGraph()
+        # StagnationAwareTransitionGraph fixes a real bug found via live
+        # testing: the original TransitionGraph.goal_biased_exploration got
+        # stuck 130+ steps in a concave maze pocket (see
+        # world_model/stagnation_graph.py docstring for the full analysis).
+        self.world_model = StagnationAwareTransitionGraph(ACTION_DIRECTION)
         self.player_color: Optional[int] = None
         self.goal_color: Optional[int] = None
         self._pending_action: Optional[GameAction] = None
@@ -171,10 +251,46 @@ class HypothesisWorldAgent(Agent):
                 return matching[0]
             self._planned_path = []
 
+        # COMPLETE-THE-FRONTIER: fixes the live-tested plateau bug (graph_
+        # nodes stuck flat at 29 for 110+ actions) WITHOUT over-triggering.
+        # Scope note (found the hard way -- an earlier, unconditional
+        # version of this check regressed the simple synthetic maze test
+        # from ~55 steps to a full FAIL by exhaustively exploring every
+        # cell's 4 directions before ever moving toward the goal, 73
+        # graph nodes vs 18 previously): this must ONLY fire when we are
+        # BOTH stagnant AND standing on a frontier node ourselves --
+        # otherwise goal_biased_exploration's own novelty/goal balance
+        # already handles normal step-by-step movement fine, and forcing
+        # frontier-completion on every step turns exploration into
+        # exhaustive-per-cell DFS instead of goal-directed search.
+        if self.world_model.is_stagnant():
+            current_known_map = self.world_model.edges.get(current_pos, {})
+            untried = [name for name in ACTION_DIRECTION if name not in current_known_map]
+            if untried:
+                matching = [a for a in candidates if a.name in untried]
+                if matching:
+                    logger.info(f"[hyp-agent] STAGNATION + standing on a frontier -- "
+                                f"trying untried direction directly instead of "
+                                f"falling through to the scoring heuristic")
+                    return matching[0]
+
+        # STAGNATION ESCAPE HATCH: if the graph hasn't grown in
+        # STAGNATION_STEPS actions, force a frontier-BFS attempt right now,
+        # bypassing the "all 4 directions known at current cell" gate below.
+        # This is the fix for the live-tested bug where goal_biased_
+        # exploration's Manhattan bias trapped the agent in a concave maze
+        # pocket for 130+ steps (graph_nodes flat at 20 from step 140-200).
+        if not self._planned_path and self.world_model.is_stagnant():
+            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_pos, goal_pos)
+            if frontier_path:
+                self._planned_path = frontier_path
+                logger.info(f"[hyp-agent] STAGNATION ({self.world_model.steps_since_new_node} "
+                            f"steps no new node) -- forcing frontier BFS: {len(frontier_path)} steps")
+
         all_dir_names = set(ACTION_DIRECTION.keys())
         current_known = set(self.world_model.edges.get(current_pos, {}).keys())
-        if all_dir_names <= current_known:
-            frontier_path = self.world_model.bfs_to_frontier(current_pos)
+        if not self._planned_path and all_dir_names <= current_known:
+            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_pos, goal_pos)
             if frontier_path:
                 self._planned_path = frontier_path
 
@@ -185,10 +301,29 @@ class HypothesisWorldAgent(Agent):
                 return matching[0]
             self._planned_path = []
 
-        best = self.world_model.goal_biased_exploration(current_pos, candidates, goal_pos)
+        best = self.world_model.goal_biased_exploration(
+            current_pos, candidates, goal_pos, hazard_positions=self._current_hazard_positions(grid)
+        )
         if best is not None and random.random() > 0.15:
             return best
         return random.choice(candidates)
+
+    def _current_hazard_positions(self, grid: np.ndarray) -> set:
+        """Positions of objects whose color matches likely_hazard_colors()
+        as of THIS frame. Recomputed every call since these objects are
+        mobile (see stagnation_graph.goal_biased_exploration docstring)."""
+        if self.player_color is None:
+            return set()
+        hazard_colors = self.engine.likely_hazard_colors(self.player_color)
+        if not hazard_colors:
+            return set()
+        objects = extract_objects(grid)
+        positions = set()
+        for obj in objects:
+            if obj.color in hazard_colors:
+                cx, cy = obj.centroid
+                positions.add((round(cx), round(cy)))
+        return positions
 
     # ------------------------------------------------------------------
     def append_frame(self, frame: FrameData) -> None:

@@ -16,6 +16,7 @@ from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
 from .templates.hypothesis_agent import HypothesisAgent
 from .templates.goal_directed_agent import GoalDirectedAgent
+from .templates.hypothesis_world_agent import HypothesisWorldAgent
 
 load_dotenv()
 
@@ -52,6 +53,7 @@ __all__ = [
     "AVAILABLE_AGENTS",
     "MultiModalLLM",
     "OpenClaw",
+    "HypothesisWorldAgent",
     "HypothesisAgent",
     "GoalDirectedAgent"
 ]
