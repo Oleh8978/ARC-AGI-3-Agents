@@ -1,31 +1,28 @@
-"""
-Hypothesis DSL + falsification engine.
+"""Active hypothesis induction over object transitions.
 
-Honest scope note (say this in the paper too): this is NOT full Bayesian
-inference over a continuous hypothesis space. It is a deterministic
-counterexample-guided falsification loop (CEGIS-style) over a small,
-finite set of template rules. That is a much weaker and cheaper claim than
-MASTER_PLAN_EN.md originally made -- and it is the claim we can actually
-back with working code and offline compute.
+For every (color, action) pair, maintains a hypothesis "this color moves
+by a constant (dx, dy) delta when this action is taken" and falsifies it
+the moment two DIFFERENT non-trivial outcomes are observed for the same
+(color, action) pair (e.g. moves freely most of the time, but is blocked
+by a wall once) -- this is the CEGIS ("falsify, don't average") behaviour
+the paper's Phase 2/3 writeups describe and that ``test_synthetic_ground_truth.py``
+checks directly.
 
-Templates covered:
-  1. ConstantDelta(color, action) -> (dx, dy)
-       "objects of this color move by this action-independent-of-position
-        vector when this action is taken" -- discovered per (color, action)
-        pair, not hardcoded like the old ACTION_DIRECTION table.
-  2. Immobile(color)
-       "objects of this color never move regardless of action" -- likely
-        background/UI/goal marker.
-  3. VanishesNear(color_a, color_b)
-       "objects of color_a disappear when they end the step adjacent to
-        an object of color_b" -- candidate for collectibles/hazards.
-  4. AppearsAfter(color, action)
-       "new objects of this color tend to appear right after this action".
-
-Every template starts as a candidate with weak/no evidence. Every observed
-(before, action, after) transition either supports or falsifies each
-active candidate. Falsified hypotheses are dropped permanently -- this is
-the actual "learning" happening, not a magic score.
+Also tracks:
+  - active_immobile_colors(): colors that are present across many frames
+    but never move -- static scenery / goal markers, and specifically
+    NOT the player, however visually similar.
+  - active_vanish_rules(): "color A disappears exactly when adjacent to
+    color B" rules (key/coin pickup, hazard contact, etc.), each scored
+    by confirmations vs. disconfirmations so a coincidental disappearance
+    doesn't get promoted to a rule.
+  - best_player_color(): the color most consistent with being player-
+    controlled (moves under player action, isn't the giant static goal
+    region).
+  - likely_hazard_colors(): colors whose *adjacency* correlates with the
+    player itself vanishing (a proxy for "touching this resets/kills
+    you" -- distinct from a benign pickup, which is a vanish_near rule
+    where the PLAYER survives).
 """
 
 from __future__ import annotations
@@ -34,192 +31,155 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .objects import GameObject, match_objects
+from .objects import GameObject, merge_by_color
 
 Delta = tuple[int, int]
 
 
 @dataclass
-class ConstantDeltaHypothesis:
-    color: int
-    action: str
-    deltas_seen: set[Delta] = field(default_factory=set)
-    support: int = 0
+class DeltaHypothesis:
+    """'color X moves by a constant delta under action A' -- falsified
+    the moment more than one distinct delta value has been observed."""
 
-    @property
-    def falsified(self) -> bool:
-        # more than one distinct delta observed for the same (color, action)
-        # means movement is NOT a fixed vector -- e.g. blocked by a wall
-        # sometimes. That's a real, useful falsification (tells you the
-        # simple rule is wrong), not a bug.
-        return len(self.deltas_seen) > 1
+    deltas_seen: list = field(default_factory=list)
+    falsified: bool = False
 
-    @property
-    def delta(self) -> Optional[Delta]:
-        if len(self.deltas_seen) == 1:
-            return next(iter(self.deltas_seen))
-        return None
+    def observe(self, delta: Delta) -> None:
+        self.deltas_seen.append(delta)
+        if len(set(self.deltas_seen)) > 1:
+            self.falsified = True
+
+    def value(self) -> Optional[Delta]:
+        if self.falsified or not self.deltas_seen:
+            return None
+        return self.deltas_seen[0]
 
 
 @dataclass
-class ImmobileHypothesis:
-    color: int
-    max_drift_seen: float = 0.0
-    observations: int = 0
+class VanishNearRule:
+    """'color_a disappears when adjacent to color_b' -- e.g. a key/coin
+    (color_a) picked up by the player (color_b), or the player (color_a)
+    dying/resetting next to a hazard (color_b)."""
 
-    @property
-    def falsified(self) -> bool:
-        # BUG FIX (found via synthetic integration test): a normal
-        # single-cell orthogonal move has magnitude exactly 1.0. The
-        # original threshold of 1.5 was meant to tolerate centroid
-        # rounding jitter, but it also silently tolerated real
-        # single-cell player movement, so a moving player could never
-        # falsify this hypothesis. 0.5 still absorbs sub-pixel jitter
-        # (drift < 0.5) while correctly falsifying on any real move.
-        return self.max_drift_seen > 0.5
-
-
-@dataclass
-class VanishNearHypothesis:
     color_a: int
     color_b: int
-    vanish_while_adjacent: int = 0
-    vanish_while_not_adjacent: int = 0
-    survive_while_adjacent: int = 0
+    confirmations: int = 0
+    disconfirmations: int = 0
 
     @property
-    def falsified(self) -> bool:
-        # if it survived adjacency at least twice with no vanish-while-not-
-        # adjacent evidence backing it, the rule isn't doing useful work
-        return self.survive_while_adjacent >= 2 and self.vanish_while_adjacent == 0
-
-
-def _adjacent(obj_a: GameObject, obj_b: GameObject, radius: int = 1) -> bool:
-    for (x1, y1) in obj_a.cells:
-        for (x2, y2) in obj_b.cells:
-            if abs(x1 - x2) <= radius and abs(y1 - y2) <= radius:
-                return True
-    return False
+    def active(self) -> bool:
+        return self.confirmations > 0 and self.disconfirmations == 0
 
 
 class HypothesisEngine:
-    """Owns the full candidate hypothesis set and updates it from
-    observed (objects_before, action_name, objects_after) transitions."""
+    # Centroid-distance treated as "adjacent" for vanish-near detection.
+    # Generous enough to cover a one-cell step onto/next-to an object
+    # while still not being so wide it treats far-apart objects as
+    # touching.
+    ADJACENCY_RADIUS = 1.6
+    # An object bigger than this many cells is treated as background
+    # scenery, not a candidate hazard/pickup, when scoring hazards.
+    MAX_HAZARD_SIZE = 40
 
     def __init__(self) -> None:
-        self.constant_delta: dict[tuple[int, str], ConstantDeltaHypothesis] = {}
-        self.immobile: dict[int, ImmobileHypothesis] = {}
-        self.vanish_near: dict[tuple[int, int], VanishNearHypothesis] = {}
-        self.step_count = 0
-        self.colors_seen: set[int] = set()
+        self.constant_delta: dict[tuple[int, str], DeltaHypothesis] = {}
+        self.color_sizes: dict[int, list[int]] = defaultdict(list)
+        self.color_seen_frames: dict[int, int] = defaultdict(int)
+        self.color_moved_ever: dict[int, bool] = defaultdict(bool)
+        self._vanish_rules: dict[tuple[int, int], VanishNearRule] = {}
 
-    # ------------------------------------------------------------------
-    def observe(self, before: list[GameObject], action: str, after: list[GameObject]) -> None:
-        self.step_count += 1
-        matches = match_objects(before, after)
+    def observe(
+        self,
+        before_objects: list[GameObject],
+        action_name: str,
+        after_objects: list[GameObject],
+    ) -> None:
+        before = merge_by_color(before_objects)
+        after = merge_by_color(after_objects)
 
-        for b, a in matches:
-            color = (b or a).color
-            self.colors_seen.add(color)
+        for color, (bx, by, bsize) in before.items():
+            self.color_sizes[color].append(bsize)
+            self.color_seen_frames[color] += 1
+            if color in after:
+                ax, ay, _ = after[color]
+                delta = (round(ax - bx), round(ay - by))
+                if delta != (0, 0):
+                    self.color_moved_ever[color] = True
+                key = (color, action_name)
+                h = self.constant_delta.setdefault(key, DeltaHypothesis())
+                h.observe(delta)
 
-            if b is not None and a is not None:
-                bx, by = b.centroid
-                ax, ay = a.centroid
-                dx, dy = round(ax - bx), round(ay - by)
+        vanished = set(before.keys()) - set(after.keys())
+        for va in vanished:
+            vax, vay, _ = before[va]
+            for vb, (bx, by, _) in before.items():
+                if vb == va:
+                    continue
+                dist = ((vax - bx) ** 2 + (vay - by) ** 2) ** 0.5
+                key = (va, vb)
+                rule = self._vanish_rules.setdefault(key, VanishNearRule(va, vb))
+                if dist <= self.ADJACENCY_RADIUS:
+                    rule.confirmations += 1
+                else:
+                    rule.disconfirmations += 1
 
-                key = (color, action)
-                h = self.constant_delta.setdefault(
-                    key, ConstantDeltaHypothesis(color=color, action=action)
-                )
-                h.deltas_seen.add((dx, dy))
-                h.support += 1
+    def predict_delta(self, color: int, action_name: str) -> Optional[Delta]:
+        h = self.constant_delta.get((color, action_name))
+        if h is None:
+            return None
+        return h.value()
 
-                imm = self.immobile.setdefault(color, ImmobileHypothesis(color=color))
-                drift = (dx ** 2 + dy ** 2) ** 0.5
-                imm.max_drift_seen = max(imm.max_drift_seen, drift)
-                imm.observations += 1
+    def active_immobile_colors(self) -> set:
+        out = set()
+        for color, seen in self.color_seen_frames.items():
+            if seen >= 3 and not self.color_moved_ever[color]:
+                out.add(color)
+        return out
 
-            elif b is not None and a is None:
-                # b vanished this step -- check adjacency to every other
-                # object present in the "before" frame
-                for other in before:
-                    if other.color == color:
-                        continue
-                    key = (color, other.color)
-                    vh = self.vanish_near.setdefault(
-                        key, VanishNearHypothesis(color_a=color, color_b=other.color)
-                    )
-                    if _adjacent(b, other):
-                        vh.vanish_while_adjacent += 1
-                    else:
-                        vh.vanish_while_not_adjacent += 1
-
-        # update survive_while_adjacent for pairs that were adjacent but
-        # BOTH objects survived (evidence against the vanish rule)
-        surviving_by_color: dict[int, list[GameObject]] = defaultdict(list)
-        for b, a in matches:
-            if a is not None:
-                surviving_by_color[a.color].append(a)
-        for (ca, cb), vh in self.vanish_near.items():
-            for obj_a in surviving_by_color.get(ca, []):
-                for obj_b in surviving_by_color.get(cb, []):
-                    if _adjacent(obj_a, obj_b):
-                        vh.survive_while_adjacent += 1
-
-    # ------------------------------------------------------------------
-    def active_constant_delta(self) -> list[ConstantDeltaHypothesis]:
-        return [h for h in self.constant_delta.values() if not h.falsified and h.support >= 2]
-
-    def active_immobile_colors(self) -> set[int]:
-        return {c for c, h in self.immobile.items() if not h.falsified and h.observations >= 3}
-
-    def active_vanish_rules(self) -> list[VanishNearHypothesis]:
-        return [h for h in self.vanish_near.values() if not h.falsified and h.vanish_while_adjacent >= 1]
-
-    def likely_hazard_colors(self, player_color: int) -> set[int]:
-        """Colors that disappear specifically upon contact with the player
-        (not just any object) -- our best available signal for "something
-        happens when I touch this", found via live testing on ls20: a
-        mobile object caused a resource/health-bar drain on contact
-        (confirmed via pixel-level bar measurement + screenshot showing
-        the player adjacent to it right before the drain). We can't tell
-        collectible from hazard from vision alone, so this is a
-        conservative "treat contact as costly, prefer avoiding it when a
-        detour is cheap" signal, not a certainty -- callers should use it
-        as a soft planning penalty, not a hard wall.
-        """
-        return {
-            ca for (ca, cb), h in self.vanish_near.items()
-            if cb == player_color and not h.falsified and h.vanish_while_adjacent >= 1
-        }
+    def active_vanish_rules(self) -> list:
+        return [r for r in self._vanish_rules.values() if r.active]
 
     def best_player_color(self) -> Optional[int]:
-        """A 'player' color is one with strong, CONSISTENT constant-delta
-        evidence across at least 2 different actions (moves differently
-        depending on which button you press -- unlike wind/scenery)."""
-        by_color: dict[int, set[str]] = defaultdict(set)
-        for (color, action), h in self.constant_delta.items():
-            if not h.falsified and h.delta is not None and h.delta != (0, 0) and h.support >= 2:
-                by_color[color].add(action)
-        candidates = {c: acts for c, acts in by_color.items() if len(acts) >= 2}
-        if not candidates:
+        scores: dict[int, float] = defaultdict(float)
+        for (color, _action), h in self.constant_delta.items():
+            if h.falsified or not h.deltas_seen:
+                continue
+            dx, dy = h.value()
+            if dx == 0 and dy == 0:
+                continue
+            scores[color] += 1.0
+        if not scores:
             return None
-        # prefer the color with the most distinct confirmed action-deltas
-        return max(candidates, key=lambda c: len(candidates[c]))
 
-    def predict_delta(self, color: int, action: str) -> Optional[Delta]:
-        h = self.constant_delta.get((color, action))
-        if h is None or h.falsified:
-            return None
-        return h.delta
+        def avg_size(c: int) -> float:
+            sizes = self.color_sizes.get(c, [1])
+            return sum(sizes) / len(sizes)
+
+        # Most action-consistent, non-trivial mover wins; ties broken by
+        # smallest average footprint (the controllable sprite is usually
+        # compact, not a sprawling background region).
+        return max(scores, key=lambda c: (scores[c], -avg_size(c)))
+
+    def likely_hazard_colors(self, player_color: int) -> set:
+        """Colors whose adjacency correlates with the PLAYER color
+        itself vanishing -- i.e. touching them makes the player
+        disappear (death/reset), as opposed to an ordinary pickup where
+        the OTHER color vanishes and the player survives."""
+        return {
+            r.color_b
+            for r in self.active_vanish_rules()
+            if r.color_a == player_color
+        }
 
     def summary(self) -> dict:
+        active = sum(1 for h in self.constant_delta.values() if not h.falsified)
+        falsified = sum(1 for h in self.constant_delta.values() if h.falsified)
         return {
-            "step_count": self.step_count,
-            "colors_seen": sorted(self.colors_seen),
-            "active_constant_delta": len(self.active_constant_delta()),
-            "falsified_constant_delta": sum(1 for h in self.constant_delta.values() if h.falsified),
-            "active_immobile_colors": sorted(self.active_immobile_colors()),
-            "active_vanish_rules": [(h.color_a, h.color_b) for h in self.active_vanish_rules()],
             "best_player_color": self.best_player_color(),
+            "active_constant_delta": active,
+            "falsified_constant_delta": falsified,
+            "active_immobile_colors": sorted(self.active_immobile_colors()),
+            "active_vanish_rules": [
+                (r.color_a, r.color_b) for r in self.active_vanish_rules()
+            ],
         }

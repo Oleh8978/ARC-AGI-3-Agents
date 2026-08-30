@@ -1,35 +1,79 @@
 """
 Hypothesis-World Agent: object-centric perception + CEGIS-style hypothesis
-falsification, feeding the SAME proven TransitionGraph/GoalDetector/BFS
-planner from goal_directed_agent.py.
+falsification + STATE-AUGMENTED planning (position + has_key).
 
-Deliberately does NOT rewrite the planner. goal_directed_agent.py's BFS
-planning, frontier exploration, and goal-biased fallback exploration are
-reused unchanged (imported below) -- they were validated across 6+ live
-runs per the docstring in that file, and per our own critique, that logic
-was never the weak part. The weak part was:
-  1. player identification via a single hardcoded ACTION_DIRECTION table
-     matched against raw color-centroid drift (breaks on multi-instance
-     colors, can't tell player from a scenery object that happens to
-     drift with camera-like motion), and
-  2. zero model of any object other than "player" and "goal" -- no way to
-     reason about hazards, collectibles, or moving obstacles.
+──────────────────────────────────────────────────────────────────────────
+Two concrete bugs fixed here, diagnosed directly from a live run log
+(ls20, 2026-08-29 10:23-10:27, 307 actions, 0 levels completed):
 
-This file replaces (1) with HypothesisEngine (per-color, per-action,
-falsifiable delta hypotheses over real connected-component objects) and
-adds the scaffolding for (2) via active_immobile_colors()/
-active_vanish_rules(), without yet wiring vanish-rules into planning --
-that's flagged as a TODO, not silently pretended to be done.
+BUG 1 -- RESET boundary corrupts the hypothesis engine.
+  choose_action() returns GameAction.RESET immediately when
+  latest_frame.state is NOT_PLAYED/GAME_OVER, WITHOUT clearing
+  self._pending_action / self._pending_objects_before. The next
+  append_frame() call then still has the STALE pending values from
+  several frames earlier, and pairs them with the frame AFTER reset
+  (i.e. the fresh level start) as if the old action had caused that
+  transition. That is a completely bogus (color, action) -> huge-jump
+  observation fed straight into HypothesisEngine.observe() every single
+  time the game auto-resets (e.g. on running out of the move budget).
+  This is directly visible in the log: 'falsified_constant_delta'
+  climbs from 0 to 16 over the run while 'active_constant_delta' shrinks,
+  and 'best_player_color' eventually flips to None -- exactly what
+  repeated bogus giant-delta observations would do to a falsification
+  engine.
+  Fix: clear all three pending_* fields (and the stale planned path)
+  whenever RESET is issued, so append_frame's existing early-return
+  guard (`if self._pending_action is None: return`) skips recording
+  anything across that boundary.
+
+BUG 2 -- goal identification never distinguished KEY from DOOR.
+  The previous version reused `goal_directed_agent.GoalDetector`, which
+  picks exactly ONE static small color as "the goal" and BFS's straight
+  to it for the entire game. Per the mechanics writeup, ls20-style games
+  need KEY reached before DOOR, and the OLD code's docstring even
+  admits level 1 was once completed by luck when a rotator happened to
+  get crossed mid-exploration -- not by design.
+  Fix: use world_model.shapes.classify_frame() to identify player / key
+  / door BY SHAPE each frame (grounded, doesn't depend on the
+  potentially-falsified HypothesisEngine color at all), track has_key
+  by watching the key object disappear while the player is standing on
+  its last known position, and plan to the key first, then the door --
+  exactly the KEY->DOOR sequencing the writeup describes. The state fed
+  into StatefulTransitionGraph is now (player_pos, has_key: bool)
+  instead of (player_pos, some-nearby-color-guess).
+
+Falls back to the OLD single-goal GoalDetector/color-centroid path ONLY
+if shape-based player/door detection can't find anything in a given
+frame (e.g. this specific rendering doesn't match the exact pixel
+pattern from the writeup) -- so the agent stays functional rather than
+going fully idle while the shapes are re-calibrated against a real
+captured frame.
+
+BUG 3 -- confirmed live: shapes.py's exact pixel patterns don't match
+this game's real rendering. A second live run (2026-08-29 11:20, ls20)
+shows `door=None key=None` for the entire run -- classify_frame() never
+found a match, so the agent silently fell back to the OLD single-color
+goal ("(fallback) goal color identified: 1") and still couldn't
+sequence key-before-door, still 0 levels completed. The exact
+PLAYER_TOP_SIG / PLAYER_BOTTOM_SIG / KEY_SIG / DOOR_SIG constants in
+world_model/shapes.py were built from the mechanics WRITEUP's prose
+description, not from a real captured frame's actual color-index grid
+-- they need calibrating against one (see world_model/calibrate.py,
+also delivered this round) before the shape-based path can ever engage.
+
+Fix (this round): make the FALLBACK path itself key/door-aware instead
+of single-goal, using data the engine already collects with no shape
+assumptions at all: among GoalDetector's static small-color candidates,
+a color that DISAPPEARS when the player touches it
+(HypothesisEngine.active_vanish_rules(), color_a=candidate,
+color_b=player_color) behaves like a one-time pickup -- i.e. a KEY --
+while a persistent candidate that never vanishes behaves like the DOOR.
+This reuses _door_pos/_last_key_pos/has_key unchanged, so every
+downstream planning method (BFS, stagnation, hazard-avoidance) works
+identically regardless of which path (shape or fallback) populated them.
 
 Drop into: agents/templates/hypothesis_world_agent.py
 Run:       uv run main.py --agent=hypothesisworldagent --game=ls20
-
-BEFORE trusting this on a live game: run
-    python tests/test_agent_integration_synthetic.py
-which drives this exact class (choose_action/append_frame) through a
-synthetic multi-step maze with known ground truth, with NO network and
-NO arcengine session required. See that file for what "passing" proves
-and does not prove.
 """
 
 from __future__ import annotations
@@ -52,7 +96,9 @@ from .goal_directed_agent import (
 )
 from world_model.objects import extract_objects
 from world_model.hypotheses import HypothesisEngine
-from world_model.stagnation_graph import StagnationAwareTransitionGraph
+from world_model.stateful_graph import StatefulTransitionGraph, State
+from world_model.shapes import classify_frame
+from world_model.journal import ObjectJournal
 
 logger = logging.getLogger()
 
@@ -81,22 +127,14 @@ def _looks_like_network_failure(e: Exception, requests_module) -> bool:
 def call_with_network_retry(fn, attempts: int, delay_seconds: float, log_prefix: str = ""):
     """Calls fn() and retries up to `attempts` times ONLY on a known
     transient network-failure signature (see _looks_like_network_failure).
-    Any other exception (a real bug, a validation error) is re-raised
-    immediately, never retried -- silently swallowing non-network errors
-    here would hide genuine bugs.
-
-    Uses exponential backoff (delay_seconds * 2**attempt) rather than a
-    fixed delay: live testing showed failures more severe than a slow
-    server response (DNS resolution failures, SSL handshake timeouts --
-    signs of a genuinely unstable local/ISP network path, not just
-    three.arcprize.org being slow). A fixed short delay hammers a network
-    that needs longer to recover; backoff gives it that time without
-    making the happy-path (a single blip) wait any longer than before.
+    Uses exponential backoff (delay_seconds * 2**attempt): live testing
+    showed failures more severe than a slow server response (DNS
+    resolution failures, SSL handshake timeouts).
     """
     try:
         import requests as _requests
     except ImportError:
-        _requests = None  # sandbox without requests installed: never retry
+        _requests = None
 
     last_exc: Optional[BaseException] = None
     for attempt in range(attempts):
@@ -116,26 +154,19 @@ def call_with_network_retry(fn, attempts: int, delay_seconds: float, log_prefix:
 
 
 class HypothesisWorldAgent(Agent):
-    """Same planning loop as GoalDirectedAgent; player/goal identification
-    driven by HypothesisEngine + object-centric perception instead of
-    ColorRegionTracker + raw centroids."""
+    """State is now (player_pos, has_key), and the goal is either the
+    KEY (before collection) or the DOOR (after) -- not one generic
+    static goal for the whole game."""
 
     MAX_ACTIONS = 500
     CALIBRATION_CYCLE = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
-    # HypothesisEngine needs at least 2 supporting observations per
-    # (color, action) pair before best_player_color() will consider it
-    # (see HypothesisEngine.best_player_color). With 4 actions that's a
-    # firm floor; we cycle a bit longer to get repeated evidence per action.
     MIN_CALIBRATION_STEPS = 10
-    # Live testing kept getting cut short by network failures against
-    # three.arcprize.org -- initially plain ReadTimeout (server slowness),
-    # later also NameResolutionError and SSL handshake timeouts (signs of
-    # a genuinely unstable local/ISP network, not just server slowness).
-    # 5 attempts with exponential backoff (5s, 10s, 20s, 40s) gives a
-    # flaky connection real recovery time without masking a truly dead
-    # connection forever.
     ACTION_RETRY_ATTEMPTS = 5
     ACTION_RETRY_DELAY_SECONDS = 5.0
+    # How close the player must be to the key's last known position, at
+    # the moment the key disappears from the frame, to count it as a
+    # real pickup (vs. a one-frame detection glitch elsewhere on screen).
+    KEY_PICKUP_RADIUS = 4.0
 
     def do_action_request(self, action: GameAction) -> FrameData:
         return call_with_network_retry(
@@ -148,17 +179,21 @@ class HypothesisWorldAgent(Agent):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.engine = HypothesisEngine()
-        self.goal_detector = GoalDetector()
-        # StagnationAwareTransitionGraph fixes a real bug found via live
-        # testing: the original TransitionGraph.goal_biased_exploration got
-        # stuck 130+ steps in a concave maze pocket (see
-        # world_model/stagnation_graph.py docstring for the full analysis).
-        self.world_model = StagnationAwareTransitionGraph(ACTION_DIRECTION)
-        self.player_color: Optional[int] = None
-        self.goal_color: Optional[int] = None
+        self.goal_detector = GoalDetector()  # fallback path only
+        self.world_model = StatefulTransitionGraph(ACTION_DIRECTION)
+        self.journal = ObjectJournal()
+        self._journal_goal_pos: Optional[Pos] = None
+        self.player_color: Optional[int] = None  # fallback path only
+        self.has_key: bool = False
+        self._last_key_pos: Optional[Pos] = None
+        self._door_pos: Optional[Pos] = None
+        # Fallback (non-shape) key/door role assignment -- see BUG 3 fix.
+        self._fallback_roles_assigned: bool = False
+        self._fallback_key_color: Optional[int] = None
+        self._fallback_door_color: Optional[int] = None
         self._pending_action: Optional[GameAction] = None
         self._pending_objects_before = None
-        self._pending_pos_before: Optional[Pos] = None
+        self._pending_state_before: Optional[State] = None
         self._action_count = 0
         self._planned_path: list[str] = []
         self._last_levels_completed: int = 0
@@ -168,8 +203,183 @@ class HypothesisWorldAgent(Agent):
         return latest_frame.state is GameState.WIN
 
     # ------------------------------------------------------------------
+    def _player_pos(self, grid: np.ndarray, objects: list) -> Optional[Pos]:
+        """Shape-based player position first (grounded: doesn't depend
+        on the possibly-falsified HypothesisEngine color at all).
+        Falls back to the old color-centroid approach only if the exact
+        5x5 bicolor pattern from the writeup isn't found in this frame
+        (e.g. this rendering differs slightly -- verify shapes.py's
+        PLAYER_TOP_SIG/PLAYER_BOTTOM_SIG against a real captured frame
+        if this fallback is triggered often)."""
+        classified = classify_frame(grid, objects)
+        player = classified["player"]
+        if player is not None:
+            cx, cy = player.centroid
+            return (round(cx), round(cy))
+
+        if self.player_color is None and self._action_count >= self.MIN_CALIBRATION_STEPS:
+            self.player_color = self.engine.best_player_color()
+            if self.player_color is not None:
+                logger.info(f"[hyp-agent] (fallback) player color identified: {self.player_color} "
+                            f"(engine summary: {self.engine.summary()})")
+        if self.player_color is None:
+            return None
+        centroids = color_centroids(grid)
+        if self.player_color not in centroids:
+            return None
+        px, py, _ = centroids[self.player_color]
+        return (round(px), round(py))
+
+    def _ranked_static_candidates(self, exclude: set) -> list:
+        """Same filtering GoalDetector.best_goal_color() uses (static,
+        small, low-position-variance), but returns ALL qualifying colors
+        ranked by score instead of just the top one -- needed to
+        consider a KEY and a DOOR as two separate candidates instead of
+        collapsing to a single goal."""
+        detector = self.goal_detector
+        scored: dict = {}
+        for color, positions in detector.static_positions.items():
+            if color in exclude or len(positions) < 3:
+                continue
+            avg_size = float(np.mean(detector.color_sizes[color]))
+            if avg_size > 200 or avg_size < 1:
+                continue
+            xs, ys = zip(*positions)
+            if float(np.var(xs) + np.var(ys)) > 1.0:
+                continue
+            scored[color] = 1.0 / (avg_size + 1.0)
+        return sorted(scored, key=lambda c: scored[c], reverse=True)
+
+    def _try_fallback_key_door(self, grid: np.ndarray, player_pos: Optional[Pos]) -> None:
+        """No-shape-assumptions key/door role assignment (BUG 3 fix):
+        among the static goal-like candidates, a color that VANISHES
+        when the player touches it acts like a one-time KEY pickup; a
+        persistent candidate that never vanishes acts like the DOOR.
+        Assigned once (like player_color), then tracked the same way
+        the shape-based path tracks has_key -- populates the SAME
+        _door_pos / _last_key_pos / has_key fields, so every planning
+        method downstream is unaffected by which path filled them in.
+        """
+        if self.player_color is None:
+            return
+        if not self._fallback_roles_assigned:
+            ranked = self._ranked_static_candidates(exclude={self.player_color})
+            if not ranked:
+                return
+            vanish_rules = self.engine.active_vanish_rules()
+            key_like = [
+                c for c in ranked
+                if any(r.color_a == c and r.color_b == self.player_color for r in vanish_rules)
+            ]
+            persistent = [c for c in ranked if c not in key_like]
+            if key_like and persistent:
+                self._fallback_key_color = key_like[0]
+                self._fallback_door_color = persistent[0]
+                self._fallback_roles_assigned = True
+                logger.info(f"[hyp-agent] (fallback) KEY candidate={self._fallback_key_color} "
+                            f"(vanishes on touch), DOOR candidate={self._fallback_door_color} (persistent)")
+            elif len(ranked) >= 1 and self._action_count > 60:
+                # No vanish-rule evidence yet after a reasonable amount of
+                # exploration -- accept the single best candidate as the
+                # door with no separate key (matches old single-goal
+                # behaviour rather than blocking forever).
+                self._fallback_door_color = ranked[0]
+                self._fallback_roles_assigned = True
+                logger.info(f"[hyp-agent] (fallback) no vanish evidence -- "
+                            f"treating {ranked[0]} as DOOR with no separate key")
+            else:
+                return
+
+        if self._fallback_door_color is not None:
+            self._door_pos = self.goal_detector.goal_position(self._fallback_door_color)
+        if self._fallback_key_color is not None:
+            centroids = color_centroids(grid)
+            if self._fallback_key_color in centroids:
+                cx, cy, _ = centroids[self._fallback_key_color]
+                self._last_key_pos = (round(cx), round(cy))
+            elif (
+                not self.has_key
+                and self._last_key_pos is not None
+                and player_pos is not None
+            ):
+                dist = abs(player_pos[0] - self._last_key_pos[0]) + abs(player_pos[1] - self._last_key_pos[1])
+                if dist <= self.KEY_PICKUP_RADIUS:
+                    self.has_key = True
+                    logger.info(f"[hyp-agent] (fallback) KEY COLLECTED near {self._last_key_pos} "
+                                f"-- now heading to door {self._door_pos}")
+
+    def _update_key_door(self, grid: np.ndarray, objects: list, player_pos: Optional[Pos]) -> None:
+        """Tracks has_key / door position, shape-based first (BUG 2 fix);
+        if shape detection finds NEITHER key nor door this frame, tries
+        the no-shape-assumptions fallback instead (BUG 3 fix). has_key
+        flips to True only when the key DISAPPEARS while the player is
+        standing near its last known position -- a real pickup, not a
+        one-frame detection glitch elsewhere on screen."""
+        classified = classify_frame(grid, objects)
+        key_obj = classified["key"]
+        door_obj = classified["door"]
+        shape_found_anything = key_obj is not None or door_obj is not None or self._door_pos is not None
+
+        if door_obj is not None:
+            self._door_pos = (door_obj.bbox[0], door_obj.bbox[1])
+
+        if key_obj is not None:
+            self._last_key_pos = (key_obj.bbox[0], key_obj.bbox[1])
+        elif (
+            not self.has_key
+            and self._last_key_pos is not None
+            and player_pos is not None
+        ):
+            dist = abs(player_pos[0] - self._last_key_pos[0]) + abs(player_pos[1] - self._last_key_pos[1])
+            if dist <= self.KEY_PICKUP_RADIUS:
+                self.has_key = True
+                logger.info(f"[hyp-agent] KEY COLLECTED near {self._last_key_pos} "
+                            f"-- now heading to door {self._door_pos}")
+
+        if not shape_found_anything:
+            self._try_fallback_key_door(grid, player_pos)
+
+        if self._door_pos is None:
+            self._try_journal_goal(objects, player_pos)
+
+    def _try_journal_goal(self, objects: list, player_pos: Optional[Pos]) -> None:
+        """Third-tier fallback (BUG 4 fix): when NEITHER shape detection
+        NOR the vanish-rule dual-role heuristic found a door, fall back
+        to the empirical object journal -- ranks every small, static,
+        in-play-area object by how "unexplained" it still is (never
+        vanished, never definitively ruled out by contact) and treats
+        the top-ranked one as the door. Confirmed useful directly against
+        a real ls20 recording: this correctly surfaced the one genuine
+        anomaly object inside the maze that neither shapes.py nor the
+        color-based fallback had any way to name."""
+        candidates = self.journal.goal_candidates()
+        if candidates:
+            self._door_pos = candidates[0].position
+
+    def _current_goal_pos(self) -> Optional[Pos]:
+        if self._door_pos is not None:
+            return self._last_key_pos if (not self.has_key and self._last_key_pos is not None) else self._door_pos
+        return None
+
+    # ------------------------------------------------------------------
+    def _current_state(self, grid: np.ndarray, objects: list) -> Optional[State]:
+        pos = self._player_pos(grid, objects)
+        if pos is None:
+            return None
+        return (pos, self.has_key)
+
+    # ------------------------------------------------------------------
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # BUG 1 fix: clear pending_* so append_frame's early-return
+            # guard skips recording a transition across this boundary --
+            # otherwise the next append_frame() pairs a STALE pending
+            # action/objects with the fresh post-reset frame and feeds
+            # HypothesisEngine a bogus giant-delta observation.
+            self._pending_action = None
+            self._pending_objects_before = None
+            self._pending_state_before = None
+            self._planned_path = []
             return GameAction.RESET
 
         grid = grid_to_array(latest_frame.frame)
@@ -179,70 +389,55 @@ class HypothesisWorldAgent(Agent):
             candidates = [a for a in GameAction
                           if a is not GameAction.RESET and a.is_simple()]
 
+        objects = extract_objects(grid)
+        player_pos = self._player_pos(grid, objects)
+
+        self.journal.ingest(self._action_count, objects, player_pos)
+
+        # Needed by _try_fallback_key_door()'s candidate ranking even
+        # when shape-based detection succeeds this frame (cheap; keeps
+        # fallback data warm in case shapes stop matching later).
         self.goal_detector.observe(grid, self.player_color)
+        self._update_key_door(grid, objects, player_pos)
 
-        if self.player_color is None and self._action_count >= self.MIN_CALIBRATION_STEPS:
-            self.player_color = self.engine.best_player_color()
-            if self.player_color is not None:
-                logger.info(f"[hyp-agent] player color identified: {self.player_color} "
-                            f"(engine summary: {self.engine.summary()})")
-
-        if self.player_color is not None and self.goal_color is None:
-            self.goal_color = self.goal_detector.best_goal_color(exclude={self.player_color})
-            if self.goal_color is not None:
-                logger.info(f"[hyp-agent] goal color identified: {self.goal_color}")
-
-        action = self._select_action(grid, candidates)
+        action = self._select_action(grid, candidates, objects)
         if action.is_complex():
             action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
 
         # stash pre-action state for append_frame
-        self._pending_objects_before = extract_objects(grid)
-        centroids = color_centroids(grid)
-        if self.player_color and self.player_color in centroids:
-            px, py, _ = centroids[self.player_color]
-            self._pending_pos_before = (round(px), round(py))
-        else:
-            self._pending_pos_before = None
+        self._pending_objects_before = objects
+        self._pending_state_before = self._current_state(grid, objects)
         self._pending_action = action
         return action
 
-    def _select_action(self, grid: np.ndarray, candidates: list[GameAction]) -> GameAction:
-        # ── Phase 1: calibration (cycle through actions to get hypothesis
-        #    evidence; unlike the old tracker, we don't gate on a
-        #    convergence score here -- best_player_color() itself refuses
-        #    to answer until evidence across >=2 actions is consistent) ──
+    def _select_action(self, grid: np.ndarray, candidates: list[GameAction], objects: list) -> GameAction:
         if self._action_count < self.MIN_CALIBRATION_STEPS:
             name = self.CALIBRATION_CYCLE[self._action_count % len(self.CALIBRATION_CYCLE)]
             matching = [a for a in candidates if a.name == name]
             return matching[0] if matching else random.choice(candidates)
 
-        if self.player_color is None or self.goal_color is None:
+        current_state = self._current_state(grid, objects)
+        if current_state is None:
             return random.choice(candidates)
+        current_pos, _current_held = current_state
 
-        centroids = color_centroids(grid)
-        if self.player_color not in centroids:
-            return random.choice(candidates)
-
-        px, py, _ = centroids[self.player_color]
-        current_pos: Pos = (round(px), round(py))
-        goal_pos = self.goal_detector.goal_position(self.goal_color)
+        goal_pos = self._current_goal_pos()
         if goal_pos is None:
             return random.choice(candidates)
 
-        # ── unchanged BFS planning, reused from GoalDirectedAgent ────────
+        # ── BFS planning over (position, has_key) state space ───────
         if self._planned_path:
             next_action_name = self._planned_path[0]
-            expected_next = self.world_model.edges.get(current_pos, {}).get(next_action_name)
+            expected_next = self.world_model.edges.get(current_state, {}).get(next_action_name)
             if expected_next is None:
                 self._planned_path = []
 
         if not self._planned_path:
-            path = self.world_model.bfs_path(current_pos, goal_pos)
+            path = self.world_model.bfs_path(current_state, goal_pos)
             if path:
                 self._planned_path = path
                 logger.info(f"[hyp-agent] BFS path found: {len(path)} steps "
-                            f"from {current_pos} to {goal_pos}")
+                            f"from {current_state} to goal near {goal_pos}")
 
         if self._planned_path:
             next_name = self._planned_path[0]
@@ -251,46 +446,31 @@ class HypothesisWorldAgent(Agent):
                 return matching[0]
             self._planned_path = []
 
-        # COMPLETE-THE-FRONTIER: fixes the live-tested plateau bug (graph_
-        # nodes stuck flat at 29 for 110+ actions) WITHOUT over-triggering.
-        # Scope note (found the hard way -- an earlier, unconditional
-        # version of this check regressed the simple synthetic maze test
-        # from ~55 steps to a full FAIL by exhaustively exploring every
-        # cell's 4 directions before ever moving toward the goal, 73
-        # graph nodes vs 18 previously): this must ONLY fire when we are
-        # BOTH stagnant AND standing on a frontier node ourselves --
-        # otherwise goal_biased_exploration's own novelty/goal balance
-        # already handles normal step-by-step movement fine, and forcing
-        # frontier-completion on every step turns exploration into
-        # exhaustive-per-cell DFS instead of goal-directed search.
+        # COMPLETE-THE-FRONTIER: only when stagnant AND standing on a
+        # frontier state ourselves -- see stagnation_graph.py history for
+        # why this must be scoped this narrowly (an unconditional version
+        # regressed a simple maze from 55 steps to a full FAIL).
         if self.world_model.is_stagnant():
-            current_known_map = self.world_model.edges.get(current_pos, {})
+            current_known_map = self.world_model.edges.get(current_state, {})
             untried = [name for name in ACTION_DIRECTION if name not in current_known_map]
             if untried:
                 matching = [a for a in candidates if a.name in untried]
                 if matching:
-                    logger.info(f"[hyp-agent] STAGNATION + standing on a frontier -- "
-                                f"trying untried direction directly instead of "
-                                f"falling through to the scoring heuristic")
+                    logger.info("[hyp-agent] STAGNATION + standing on a frontier state -- "
+                                "trying untried direction directly")
                     return matching[0]
 
-        # STAGNATION ESCAPE HATCH: if the graph hasn't grown in
-        # STAGNATION_STEPS actions, force a frontier-BFS attempt right now,
-        # bypassing the "all 4 directions known at current cell" gate below.
-        # This is the fix for the live-tested bug where goal_biased_
-        # exploration's Manhattan bias trapped the agent in a concave maze
-        # pocket for 130+ steps (graph_nodes flat at 20 from step 140-200).
         if not self._planned_path and self.world_model.is_stagnant():
-            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_pos, goal_pos)
+            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_state, goal_pos)
             if frontier_path:
                 self._planned_path = frontier_path
                 logger.info(f"[hyp-agent] STAGNATION ({self.world_model.steps_since_new_node} "
-                            f"steps no new node) -- forcing frontier BFS: {len(frontier_path)} steps")
+                            f"steps no new state) -- forcing frontier BFS: {len(frontier_path)} steps")
 
         all_dir_names = set(ACTION_DIRECTION.keys())
-        current_known = set(self.world_model.edges.get(current_pos, {}).keys())
+        current_known = set(self.world_model.edges.get(current_state, {}).keys())
         if not self._planned_path and all_dir_names <= current_known:
-            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_pos, goal_pos)
+            frontier_path = self.world_model.bfs_to_frontier_goal_directed(current_state, goal_pos)
             if frontier_path:
                 self._planned_path = frontier_path
 
@@ -301,23 +481,20 @@ class HypothesisWorldAgent(Agent):
                 return matching[0]
             self._planned_path = []
 
+        hazard_positions = self._current_hazard_positions(objects)
         best = self.world_model.goal_biased_exploration(
-            current_pos, candidates, goal_pos, hazard_positions=self._current_hazard_positions(grid)
+            current_state, candidates, goal_pos, hazard_positions=hazard_positions
         )
         if best is not None and random.random() > 0.15:
             return best
         return random.choice(candidates)
 
-    def _current_hazard_positions(self, grid: np.ndarray) -> set:
-        """Positions of objects whose color matches likely_hazard_colors()
-        as of THIS frame. Recomputed every call since these objects are
-        mobile (see stagnation_graph.goal_biased_exploration docstring)."""
+    def _current_hazard_positions(self, objects: list) -> set:
         if self.player_color is None:
             return set()
         hazard_colors = self.engine.likely_hazard_colors(self.player_color)
         if not hazard_colors:
             return set()
-        objects = extract_objects(grid)
         positions = set()
         for obj in objects:
             if obj.color in hazard_colors:
@@ -329,24 +506,23 @@ class HypothesisWorldAgent(Agent):
     def append_frame(self, frame: FrameData) -> None:
         super().append_frame(frame)
         if self._pending_action is None or self._pending_objects_before is None:
+            # BUG 1 fix: this now correctly triggers right after a RESET
+            # (see choose_action), skipping the bogus cross-reset
+            # observation that used to corrupt the hypothesis engine.
             return
 
         grid_after = grid_to_array(frame.frame)
         objects_after = extract_objects(grid_after)
 
-        # feed the hypothesis engine (replaces tracker.observe)
         self.engine.observe(self._pending_objects_before, self._pending_action.name, objects_after)
 
-        # record position transition in the BFS world model (unchanged)
-        if self._pending_pos_before is not None and self.player_color is not None:
-            centroids_after = color_centroids(grid_after)
-            if self.player_color in centroids_after:
-                ax, ay, _ = centroids_after[self.player_color]
-                pos_after: Pos = (round(ax), round(ay))
-                self.world_model.record(self._pending_pos_before, self._pending_action.name, pos_after)
+        if self._pending_state_before is not None:
+            state_after = self._current_state(grid_after, objects_after)
+            if state_after is not None:
+                self.world_model.record(self._pending_state_before, self._pending_action.name, state_after)
                 if (self._planned_path
-                        and pos_after != self.world_model.edges.get(
-                            self._pending_pos_before, {}
+                        and state_after != self.world_model.edges.get(
+                            self._pending_state_before, {}
                         ).get(self._pending_action.name)):
                     self._planned_path = []
 
@@ -354,13 +530,31 @@ class HypothesisWorldAgent(Agent):
 
         if frame.levels_completed > self._last_levels_completed:
             logger.info(f"[hyp-agent] LEVEL COMPLETE! {self._last_levels_completed} -> "
-                        f"{frame.levels_completed}. Keeping graph+engine, resetting goal.")
+                        f"{frame.levels_completed}. Keeping graph+engine, resetting goal/key state.")
             self._last_levels_completed = frame.levels_completed
             self.goal_detector = GoalDetector()
-            self.goal_color = None
+            self.journal = ObjectJournal()
+            self.has_key = False
+            self._last_key_pos = None
+            self._door_pos = None
+            self._fallback_roles_assigned = False
+            self._fallback_key_color = None
+            self._fallback_door_color = None
             self._planned_path = []
 
         if self._action_count % 20 == 0:
-            logger.info(f"[diag] step={self._action_count} player={self.player_color} "
-                        f"goal={self.goal_color} graph_nodes={len(self.world_model.edges)} "
+            steps_to_goal = None
+            if self._pending_state_before is not None and self._door_pos is not None:
+                goal_pos = self._current_goal_pos()
+                if goal_pos is not None:
+                    path = self.world_model.bfs_path(self._pending_state_before, goal_pos)
+                    steps_to_goal = len(path) if path is not None else "unknown (no path learned yet)"
+            logger.info(f"[diag] step={self._action_count} player_color={self.player_color} "
+                        f"has_key={self.has_key} door={self._door_pos} key={self._last_key_pos} "
+                        f"fallback_key_color={self._fallback_key_color} fallback_door_color={self._fallback_door_color} "
+                        f"steps_to_goal={steps_to_goal} "
+                        f"graph_nodes={len(self.world_model.edges)} "
                         f"levels={frame.levels_completed} engine={self.engine.summary()}")
+
+        if self._action_count % 50 == 0:
+            logger.info("\n" + self.journal.describe())
